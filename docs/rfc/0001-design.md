@@ -25,6 +25,7 @@ that must run once, a single writer per shard) and want a lock with defined fail
 | Crash recovery | A lock whose holder stops renewing is free within one TTL of its last renewal | Abandon tests; the demo measures takeover time |
 | Loss detection | A holder whose renewals fail sees `ErrLost` by its own lease deadline, and `Valid()` is false after it | Outage tests; the demo measures time to notice |
 | Leak-free | 0 leases left after releases and failed acquisitions | Lease counts in tests and the demo |
+| Ownership | 0 renewals or releases accepted without the holder's secret (missing, wrong, another lock's, or a guessed lease id) | Secret tests in the library and API, and hand mutants that remove the check |
 
 ## Goals
 
@@ -68,9 +69,14 @@ client (Go library or HTTP) --> lock layer --> kv.Backend --> etcd v3 (JSON gate
   successor's key), then revokes the lease. Repeating it is harmless.
 - **Lost replies.** If a create succeeded but its reply was lost, the retry finds the key on its own
   lease and treats it as acquired.
-- **HTTP API** for other languages: `POST /v1/locks/{name}` (acquire, 409 with the holder if held),
-  `POST /v1/leases/{id}/keepalive`, `DELETE /v1/locks/{name}?lease_id=`, `GET /v1/locks/{name}`,
-  `GET /healthz`. The service is stateless over the store, so several instances can share one etcd.
+- **Owner secret** (ADR 0004). Each acquisition gets 256 random bits from `crypto/rand`, returned
+  once; the key's value stores the owner and the SHA-256 of the secret. Renewing or releasing by name
+  needs the secret, compared in constant time, and then acts on the lease stored with the key. Lease
+  ids are visible and guessable, so they are never accepted as proof of ownership.
+- **HTTP API** for other languages: `POST /v1/locks/{name}` (acquire, returns the secret; 409 with
+  the holder if held), `POST /v1/locks/{name}/keepalive` and `DELETE /v1/locks/{name}` (both with the
+  `Lock-Secret` header: 401 without it, 403 if wrong), `GET /v1/locks/{name}`, `GET /healthz`. The
+  service is stateless over the store, so several instances can share one etcd.
 - **etcd access** is the v3 JSON gateway over `net/http`, standard library only (ADR 0003), with
   per-request timeouts, bounded retries with backoff, and rotation across endpoints.
 
@@ -108,6 +114,9 @@ client (Go library or HTTP) --> lock layer --> kv.Backend --> etcd v3 (JSON gate
   while a successor holds the lock; `Valid()` and `Done()` only help once it resumes. The fencing
   token is the defence, and storage that checks it is M2. Until then, M1 alone does not prevent a
   paused holder's late write.
+- **The owner secret is a bearer credential.** Whoever has it can renew or release the lock. M1 has
+  no TLS and no caller authentication, so the service binds to 127.0.0.1 by default; a first version
+  that took the lease id as proof was replaced after a security review (ADR 0004).
 - **Clock rate, not clock value.** The client's deadline uses its own monotonic clock; if it runs
   much slower than the store's, the client could think it holds a lease that has expired. etcd
   assumes bounded rate drift too.

@@ -129,7 +129,8 @@ func (c *Client) Get(ctx context.Context, name string) (Holder, bool, error) {
 	if err != nil || !ok {
 		return Holder{}, false, err
 	}
-	return Holder{Owner: e.Value, Token: e.CreateRevision, Lease: e.Lease}, true, nil
+	h, err := holderOf(e)
+	return h, err == nil, err
 }
 
 // TryAcquire takes the lock if it is free and returns a *HeldError if it is not.
@@ -154,13 +155,14 @@ func (c *Client) acquire(ctx context.Context, name, owner string, ttl time.Durat
 	if err != nil {
 		return nil, fmt.Errorf("acquire %s: grant: %w", name, err)
 	}
-	l := &Lock{Name: name, Owner: owner, Lease: id, TTL: granted, c: c, key: c.Key(name),
+	l := &Lock{Name: name, Owner: owner, Lease: id, TTL: granted, Secret: newSecret(), c: c, key: c.Key(name),
 		until: sent.Add(granted), done: make(chan struct{}), stop: make(chan struct{}), stopped: make(chan struct{})}
+	value := encodeValue(owner, l.Secret)
 	go l.keepAlive()
 	delay := c.cfg.RetryMin
 	for {
 		octx, cancel := context.WithTimeout(ctx, c.cfg.OpTimeout)
-		created, cur, err := c.cfg.Backend.CreateIfAbsent(octx, l.key, owner, id)
+		created, cur, err := c.cfg.Backend.CreateIfAbsent(octx, l.key, value, id)
 		cancel()
 		switch {
 		case err == nil && (created || cur.Lease == id):
@@ -168,7 +170,11 @@ func (c *Client) acquire(ctx context.Context, name, owner string, ttl time.Durat
 			l.Token = cur.CreateRevision
 			return l, nil
 		case err == nil && !wait:
-			return nil, errors.Join(&HeldError{Holder: Holder{Owner: cur.Value, Token: cur.CreateRevision, Lease: cur.Lease}}, l.cleanup(ctx))
+			h, herr := holderOf(cur)
+			if herr != nil {
+				return nil, errors.Join(herr, l.cleanup(ctx))
+			}
+			return nil, errors.Join(&HeldError{Holder: h}, l.cleanup(ctx))
 		case err != nil && (!wait || !errors.Is(err, kv.ErrUnavailable)):
 			return nil, errors.Join(fmt.Errorf("acquire %s: %w", name, err), l.cleanup(ctx))
 		}
@@ -193,6 +199,9 @@ type Lock struct {
 	Token int64
 	Lease kv.LeaseID
 	TTL   time.Duration
+	// Secret proves ownership to Client.KeepAlive and Client.Release (and the HTTP API); only its
+	// SHA-256 is stored. Never log it.
+	Secret string
 
 	c       *Client
 	key     string
@@ -294,6 +303,7 @@ func (l *Lock) cleanup(ctx context.Context) error {
 }
 
 // Release deletes the lock key if this lease still holds it, then revokes the lease; safe to call twice.
+// The *Lock value is the in-process capability; callers outside the process use Client.Release with the secret.
 func (l *Lock) Release(ctx context.Context) error {
 	l.halt()
 	l.end(ErrReleased)

@@ -24,7 +24,7 @@ demo: bench
 serve:
 	go run ./cmd/distributed-lock-service serve
 
-# Known vulnerabilities in called code (Go 1.26.10 as in CI).
+# Known vulnerabilities in called code (Go 1.26.11 as in CI); any finding fails.
 audit:
 	bash scripts/vulncheck.sh
 

@@ -83,6 +83,37 @@ func TestEtcdLocksAcrossMembers(t *testing.T) {
 	t.Logf("etcd: 30 acquisitions by 6 clients over %d members, 0 overlaps, tokens %d..%d", len(eps), tokens[0], tokens[len(tokens)-1])
 }
 
+func TestEtcdSecretGuardsReleaseAndKeepAlive(t *testing.T) {
+	c, err := lock.New(lock.Config{Backend: newClient(t, Options{Endpoints: endpoints(t)}), Prefix: fmt.Sprintf("/dls-test/%d/", time.Now().UnixNano())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	g, err := c.Grant(ctx, "guarded", "a", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guessed := fmt.Sprint(int64(g.Lease))
+	for _, secret := range []string{"", guessed, strings.Repeat("0", 64)} {
+		if err := c.Release(ctx, "guarded", secret); err == nil {
+			t.Fatalf("release with %.12q accepted", secret)
+		}
+		if _, err := c.KeepAlive(ctx, "guarded", secret); err == nil {
+			t.Fatalf("keepalive with %.12q accepted", secret)
+		}
+	}
+	if _, err := c.KeepAlive(ctx, "guarded", g.Secret); err != nil {
+		t.Fatalf("keepalive with the secret: %v", err)
+	}
+	if err := c.Release(ctx, "guarded", g.Secret); err != nil {
+		t.Fatalf("release with the secret: %v", err)
+	}
+	if _, ok, err := c.Get(ctx, "guarded"); err != nil || ok {
+		t.Fatalf("after release: held=%v err=%v", ok, err)
+	}
+	t.Logf("etcd: release and keep-alive refused without the owner secret (empty, lease id, wrong), accepted with it")
+}
+
 func TestEtcdAbandonedLeaseExpires(t *testing.T) {
 	c, err := lock.New(lock.Config{Backend: newClient(t, Options{Endpoints: endpoints(t)}), Prefix: fmt.Sprintf("/dls-test/%d/", time.Now().UnixNano())})
 	if err != nil {

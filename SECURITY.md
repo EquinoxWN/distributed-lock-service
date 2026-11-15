@@ -18,11 +18,12 @@ This project is pre-1.0. Only the latest commit on `main` receives fixes.
 
 - **In scope:** Two holders of the same lock at once, a fencing token that is not larger than an
   earlier one, a release that deletes another holder's lock, a lock reported as valid after its lease
-  deadline, crashes or panics on malformed requests or store answers, unbounded memory use from
-  untrusted input, and data races.
+  deadline, a renewal or release accepted without the holder's owner secret, an owner secret that
+  appears in a log, answer or store value, crashes or panics on malformed requests or store answers,
+  unbounded memory use from untrusted input, and data races.
 - **Out of scope:** Performance problems and missing features listed on the roadmap. The HTTP API has
-  no authentication in M1 (it binds to 127.0.0.1 by default); any caller that can reach it can
-  release a lock if it knows the lease id.
+  no caller authentication or TLS in M1 (it binds to 127.0.0.1 by default): any caller that can reach
+  it can acquire a free lock, and a leaked owner secret lets its bearer renew or release that lock.
 
 ## How this repository protects itself
 

@@ -1,8 +1,10 @@
 // Package api serves locks over HTTP for clients in any language.
 //
 // The service keeps no state of its own: every call goes to the store, so several instances can
-// serve the same store. The caller renews its lease with POST /v1/leases/{id}/keepalive at about a
-// third of the TTL; if it stops, the lease expires in the store and the lock is freed.
+// serve the same store. Acquiring returns a random owner secret once; the caller renews with
+// POST /v1/locks/{name}/keepalive at about a third of the TTL and releases with
+// DELETE /v1/locks/{name}, both with the secret in the Lock-Secret header. Lease ids are not
+// accepted as proof of ownership. If the caller stops renewing, the lease expires and the lock is freed.
 package api
 
 import (
@@ -12,13 +14,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/EquinoxWN/distributed-lock-service/internal/kv"
 	"github.com/EquinoxWN/distributed-lock-service/internal/lock"
 )
+
+// SecretHeader carries the owner secret on keep-alive and release.
+const SecretHeader = "Lock-Secret"
 
 const (
 	maxBody   = 4 << 10
@@ -27,17 +31,20 @@ const (
 
 // Server handles the HTTP API.
 type Server struct {
-	backend kv.Backend
-	prefix  string
-	log     *slog.Logger
+	locks *lock.Client
+	log   *slog.Logger
 }
 
 // New returns a server over a store; log may be nil.
-func New(b kv.Backend, log *slog.Logger) *Server {
+func New(b kv.Backend, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{backend: b, prefix: lock.DefaultPrefix, log: log}
+	c, err := lock.New(lock.Config{Backend: b, OpTimeout: opTimeout})
+	if err != nil {
+		return nil, err
+	}
+	return &Server{locks: c, log: log}, nil
 }
 
 // Handler returns the routes.
@@ -46,7 +53,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/locks/{name}", s.acquire)
 	mux.HandleFunc("GET /v1/locks/{name}", s.get)
 	mux.HandleFunc("DELETE /v1/locks/{name}", s.release)
-	mux.HandleFunc("POST /v1/leases/{id}/keepalive", s.keepAlive)
+	mux.HandleFunc("POST /v1/locks/{name}/keepalive", s.keepAlive)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -59,13 +66,14 @@ type AcquireRequest struct {
 	TTLMs int64  `json:"ttl_ms"`
 }
 
-// AcquireResponse is returned when the lock is taken.
+// AcquireResponse is returned when the lock is taken; Secret is shown only here.
 type AcquireResponse struct {
-	Name  string     `json:"name"`
-	Owner string     `json:"owner"`
-	Token int64      `json:"token"`
-	Lease kv.LeaseID `json:"lease_id,string"`
-	TTLMs int64      `json:"ttl_ms"`
+	Name   string     `json:"name"`
+	Owner  string     `json:"owner"`
+	Token  int64      `json:"token"`
+	Lease  kv.LeaseID `json:"lease_id,string"`
+	TTLMs  int64      `json:"ttl_ms"`
+	Secret string     `json:"secret"`
 }
 
 type errorBody struct {
@@ -77,12 +85,13 @@ type errorBody struct {
 // writeJSON writes one JSON answer.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	// The status line is sent; an encode error here means the client went away.
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// fail maps an error to a status and a stable error code.
+// fail maps an error to a status and a stable error code; logs never include request headers.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	var held *lock.HeldError
 	switch {
@@ -90,8 +99,12 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeJSON(w, http.StatusConflict, errorBody{Error: "held", Message: err.Error(), Holder: &held.Holder})
 	case errors.Is(err, lock.ErrInvalid):
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid", Message: err.Error()})
+	case errors.Is(err, lock.ErrSecretRequired):
+		writeJSON(w, http.StatusUnauthorized, errorBody{Error: "secret_required", Message: "send the owner secret in the " + SecretHeader + " header"})
+	case errors.Is(err, lock.ErrForbidden):
+		writeJSON(w, http.StatusForbidden, errorBody{Error: "forbidden", Message: "owner secret does not match the lock holder"})
 	case errors.Is(err, kv.ErrLeaseNotFound):
-		writeJSON(w, http.StatusNotFound, errorBody{Error: "lease_not_found", Message: "lease expired, revoked or unknown"})
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_held", Message: "lock not held: lease expired, revoked or released"})
 	case errors.Is(err, kv.ErrUnavailable), errors.Is(err, context.DeadlineExceeded):
 		s.log.Warn("store unavailable", "path", r.URL.Path, "err", err)
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "unavailable", Message: "lock store unavailable, retry with backoff"})
@@ -117,18 +130,8 @@ func decode(r *http.Request, w http.ResponseWriter, v any) error {
 	return nil
 }
 
-// leaseParam parses a lease id from a path or query value.
-func leaseParam(v string) (kv.LeaseID, error) {
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%w: lease id %q", lock.ErrInvalid, v)
-	}
-	return kv.LeaseID(n), nil
-}
-
-// acquire grants a lease and creates the lock key on it, or answers 409 with the holder.
+// acquire takes the lock and returns its secret once, or answers 409 with the holder.
 func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
 	var req AcquireRequest
 	if err := decode(r, w, &req); err != nil {
 		s.fail(w, r, err)
@@ -138,41 +141,17 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
 	if req.TTLMs <= 0 || req.TTLMs > int64(lock.MaxTTL/time.Millisecond) {
 		ttl = 0 // rejected by Validate with the allowed range
 	}
-	if err := lock.Validate(name, req.Owner, ttl); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), opTimeout)
-	defer cancel()
-	id, granted, err := s.backend.Grant(ctx, ttl)
+	g, err := s.locks.Grant(r.Context(), r.PathValue("name"), req.Owner, ttl)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	ok, cur, err := s.backend.CreateIfAbsent(ctx, s.prefix+name, req.Owner, id)
-	if err == nil && (ok || cur.Lease == id) {
-		writeJSON(w, http.StatusOK, AcquireResponse{Name: name, Owner: req.Owner, Token: cur.CreateRevision, Lease: id, TTLMs: granted.Milliseconds()})
-		return
-	}
-	if rerr := s.backend.Revoke(context.WithoutCancel(ctx), id); rerr != nil && !errors.Is(rerr, kv.ErrLeaseNotFound) {
-		err = errors.Join(err, fmt.Errorf("revoke unused lease %d: %w", id, rerr))
-	}
-	if err == nil {
-		err = &lock.HeldError{Holder: lock.Holder{Owner: cur.Value, Token: cur.CreateRevision, Lease: cur.Lease}}
-	}
-	s.fail(w, r, err)
+	writeJSON(w, http.StatusOK, AcquireResponse{Name: g.Name, Owner: g.Owner, Token: g.Token, Lease: g.Lease, TTLMs: g.TTL.Milliseconds(), Secret: g.Secret})
 }
 
-// get returns the current holder.
+// get returns the current holder (never its secret).
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if err := lock.Validate(name, "x", lock.MinTTL); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), opTimeout)
-	defer cancel()
-	cur, ok, err := s.backend.Get(ctx, s.prefix+name)
+	h, ok, err := s.locks.Get(r.Context(), r.PathValue("name"))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -181,47 +160,24 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_held", Message: "nobody holds this lock"})
 		return
 	}
-	writeJSON(w, http.StatusOK, lock.Holder{Owner: cur.Value, Token: cur.CreateRevision, Lease: cur.Lease})
+	writeJSON(w, http.StatusOK, h)
 }
 
-// release deletes the key if the given lease holds it and revokes the lease; repeating it is harmless.
+// release frees the lock if the secret is the holder's; a lock nobody holds answers 204 too.
 func (s *Server) release(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if err := lock.Validate(name, "x", lock.MinTTL); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	id, err := leaseParam(r.URL.Query().Get("lease_id"))
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), opTimeout)
-	defer cancel()
-	if _, err := s.backend.DeleteIfLease(ctx, s.prefix+name, id); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	if err := s.backend.Revoke(ctx, id); err != nil && !errors.Is(err, kv.ErrLeaseNotFound) {
+	if err := s.locks.Release(r.Context(), r.PathValue("name"), r.Header.Get(SecretHeader)); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// keepAlive renews a lease and returns its TTL.
+// keepAlive renews the holder's lease if the secret matches and returns its TTL.
 func (s *Server) keepAlive(w http.ResponseWriter, r *http.Request) {
-	id, err := leaseParam(r.PathValue("id"))
+	ttl, err := s.locks.KeepAlive(r.Context(), r.PathValue("name"), r.Header.Get(SecretHeader))
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), opTimeout)
-	defer cancel()
-	ttl, err := s.backend.KeepAlive(ctx, id)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"lease_id": strconv.FormatInt(int64(id), 10), "ttl_ms": ttl.Milliseconds()})
+	writeJSON(w, http.StatusOK, map[string]any{"ttl_ms": ttl.Milliseconds()})
 }

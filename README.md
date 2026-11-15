@@ -8,8 +8,9 @@
 Part of my **Distributed Systems & Storage** list · Go · core project
 
 M1 is built: named locks held as leases with a time-to-live that the holder keeps renewing, stored
-in etcd, and a fencing token with every acquisition that only ever increases. It works as a Go
-library and as an HTTP service. Locally everything runs on an in-process store with etcd's lease and
+in etcd, and a fencing token with every acquisition that only ever increases. Each acquisition also
+returns a random owner secret, required to renew or release the lock. It works as a Go library and as
+an HTTP service. Locally everything runs on an in-process store with etcd's lease and
 revision rules; the tests against a real three-member etcd cluster run only in CI and have not run
 yet. Storage that rejects old tokens is M2.
 
@@ -21,13 +22,14 @@ one TTL, and a holder whose renewals fail sees the loss by its deadline:
 
 ![lock demo: contention, renewal, crash and outage scenarios with the verify line](docs/proof/demo.jpg)
 
-The HTTP API on 127.0.0.1 with curl: acquire, 409 with the holder, keep-alive, release, re-acquire
-with a larger token, keep-alive on a released lease 404, invalid owner 400:
+The HTTP API on 127.0.0.1 with curl: acquire (with its owner secret, shortened in the image), 409
+with the holder, keep-alive with the secret, release refused with a guessed lease id (403) and with
+no secret (401), release with the secret, re-acquire with a larger token, invalid owner 400:
 
 ![HTTP API run with curl](docs/proof/api.jpg)
 
-gofmt and go vet are clean, 41 tests pass (plus 20 subtests), and govulncheck reports only one
-allowlisted Go standard-library advisory (see [Tests and results](#tests-and-results)):
+gofmt and go vet are clean, 48 tests pass (plus 20 subtests), and govulncheck with Go 1.26.11
+finds no vulnerabilities (see [Tests and results](#tests-and-results)):
 
 ![gofmt, go vet, go test and govulncheck output](docs/proof/tests.jpg)
 
@@ -75,8 +77,13 @@ In M1 terms:
   `Done()` closes, `Err()` is `ErrLost`, `Valid()` is false.
 - **Crash.** A holder that stops renewing loses the lock one TTL after its last renewal; the store
   deletes the key and the next waiter gets a larger token.
-- **Release** deletes the key only if this lease still holds it, then revokes the lease; a holder
-  whose lock already expired cannot delete its successor's lock.
+- **Owner secret** ([ADR 0004](docs/adr/0004-owner-secret-not-lease-id.md)). Each acquisition gets
+  a random 256-bit secret from `crypto/rand`, returned once. The store keeps only its SHA-256 next to
+  the owner. Renewing or releasing by name (`Client.KeepAlive`, `Client.Release`, or the HTTP API's
+  `Lock-Secret` header) needs the secret, compared in constant time. A lease id, which is visible and
+  guessable, is not accepted as proof. The secret is never logged.
+- **Release** deletes the key only if the holder's lease still holds it, then revokes the lease; a
+  holder whose lock already expired cannot delete its successor's lock (its secret no longer matches).
 - **What M1 does not stop:** a holder paused longer than its TTL that wakes up and writes. It can
   find out (`Valid()`, `Done()`), and it carries an older token; storage that rejects that token is M2.
 
@@ -84,7 +91,7 @@ In M1 terms:
 
 - **Who:** Backend engineers running several workers or service instances against shared state (a job that must run once, one writer per shard), and anyone preparing the "design a distributed lock" interview question.
 - **The problem:** A lock with a timeout frees itself when its holder pauses or crashes, but the old holder may still act; here every acquisition has a token that only increases, and the holder is told when its lease is gone instead of finding out later.
-- **How to use it:** In Go, call `lock.New` with an etcd backend (`etcdkv.New`), then `Acquire`, pass `l.Token` with every write, watch `l.Done()`, and `Release`; from other languages run `serve -etcd ...` and use the HTTP API; run `make demo` to see the failure scenarios.
+- **How to use it:** In Go, call `lock.New` with an etcd backend (`etcdkv.New`), then `Acquire`, pass `l.Token` with every write, watch `l.Done()`, and `Release`; from other languages run `serve -etcd ...`, keep the `secret` from the acquire answer, and send it in `Lock-Secret` to renew and release; run `make demo` to see the failure scenarios.
 
 ## Tech stack
 
@@ -92,8 +99,8 @@ In M1 terms:
 |---|---|---|
 | Core | Go 1.26 standard library only (ADR 0003); `kv.Backend` interface with a shared contract test | Watches for FIFO waiting instead of polling |
 | Store | etcd v3 through its JSON gateway (`net/http`), timeouts, bounded retries, endpoint rotation; in-process store with etcd's rules for local runs | |
-| Safety | Leases with TTL, keep-alive every TTL/3, conservative client deadline, monotonic fencing tokens, release only by the holding lease | Storage that rejects older tokens (M2) |
-| API | Go library (`internal/lock`); HTTP: `POST`/`GET`/`DELETE /v1/locks/{name}`, `POST /v1/leases/{id}/keepalive`, `GET /healthz` | gRPC API |
+| Safety | Leases with TTL, keep-alive every TTL/3, conservative client deadline, monotonic fencing tokens, release only by the holding lease, random owner secret (stored hashed, compared in constant time) for renew and release | Storage that rejects older tokens (M2), TLS |
+| API | Go library (`internal/lock`); HTTP: `POST`/`GET`/`DELETE /v1/locks/{name}`, `POST /v1/locks/{name}/keepalive` (both with `Lock-Secret`), `GET /healthz` | gRPC API |
 | Test | Unit, backend contract (twice locally), concurrency, fault injection, HTTP, end-to-end demo, hand mutation testing; real etcd in CI | Simulated GC pauses, partitions, clock jumps, naive-lock comparison |
 | CI | gofmt, go vet, `go test -race`, govulncheck, demo with a `::notice`; three-member etcd cluster with the integration tests | |
 
@@ -104,12 +111,12 @@ In M1 terms:
 | `internal/kv/kvtest` | The contract every backend must pass (10 cases) |
 | `internal/memkv` | In-process store: leases, revisions, expiry on an injected clock, fault hook for tests |
 | `internal/etcdkv` | etcd v3 client over the JSON gateway; `etcd_integration_test.go` runs against real etcd (CI) |
-| `internal/lock` | Acquire, renew, release, loss detection, fencing tokens |
+| `internal/lock` | Acquire, renew, release, loss detection, fencing tokens; `secret.go`: owner secrets, renew and release by name |
 | `internal/api` | HTTP handlers and error mapping |
 
 ## Run it
 
-Prerequisites: Go 1.26 or newer (CI uses 1.26.10). No Docker is needed. For the etcd backend, an
+Prerequisites: Go 1.26 or newer (CI uses 1.26.11). No Docker is needed. For the etcd backend, an
 etcd v3.5 or newer cluster with the gRPC gateway enabled (the default).
 
 ```bash
@@ -127,39 +134,43 @@ Try the API (in a second terminal while `make serve` runs):
 
 ```bash
 curl -H 'Content-Type: application/json' -X POST localhost:8080/v1/locks/orders \
-  -d '{"owner":"worker-a","ttl_ms":10000}'          # {"token":2,"lease_id":"1",...}
-curl -X POST localhost:8080/v1/leases/1/keepalive    # repeat about every ttl/3
-curl -X DELETE 'localhost:8080/v1/locks/orders?lease_id=1'
+  -d '{"owner":"worker-a","ttl_ms":10000}'          # {"token":2,"lease_id":"1",...,"secret":"<64 hex>"}
+curl -X POST -H "Lock-Secret: $SECRET" localhost:8080/v1/locks/orders/keepalive   # about every ttl/3
+curl -X DELETE -H "Lock-Secret: $SECRET" localhost:8080/v1/locks/orders
 ```
+
+The secret is shown only in the acquire answer. A missing secret is 401, a wrong one 403. Keep it
+out of logs and URLs.
 
 Flags: `serve -addr -etcd`; `demo -clients -rounds -ttl`. The service reads no environment
 variables; the integration test reads `DLS_ETCD_ENDPOINTS`.
 
 ## Tests and results
 
-Latest local run (full detail in [docs/results/m1.md](docs/results/m1.md)): **41 passed (plus 20 subtests), 0 failed**.
+Latest local run (full detail in [docs/results/m1.md](docs/results/m1.md)): **48 passed (plus 20 subtests), 0 failed**.
 
 | Test file | Tests | What it proves |
 |---|---|---|
 | `cmd/distributed-lock-service/main_test.go` | 3 | The demo runs end to end with every verify count at 0; 12 bad argument sets are refused; backend selection |
-| `internal/api/api_test.go` | 6 | Acquire, 409 with holder, keep-alive past the TTL, idempotent release, re-acquire with a larger token; expiry frees the lock; a stale release leaves the new holder; 14 bad requests are 400; store outage 503 without leaking internals; health check |
+| `internal/api/api_test.go` | 8 | Acquire with a 64-hex secret, 409 with holder (no secret in it), keep-alive past the TTL, idempotent release, re-acquire with a larger token; release and keep-alive refused without the secret (401), with a wrong secret, another lock's secret or the guessed lease id (403), and the old lease-id route is gone; 20 acquisitions give 20 different secrets and none appears in the server log; expiry frees the lock; a stale holder cannot release or renew the new holder's lock; 13 bad requests are 400; store outage 503 without leaking internals; health check |
 | `internal/etcdkv/etcdkv_test.go` | 11 | The backend contract through a fake JSON gateway; option validation; 5xx retried then success; gives up after N attempts; 4xx not retried; failover to the next endpoint; request timeout; caller cancel stops retries; 7 malformed answers rejected; TTL rounding; int64 decoding |
 | `internal/lock/lock_test.go` | 15 | Holder reported and loser's lease revoked; tokens increase across names and clients; renewal holds past the TTL; crash takeover after about one TTL with a larger token; loss on failed renewals and on revoked lease; `Valid()` false past the deadline; short outage ridden out; 8x10 concurrent acquisitions with 0 overlaps; context cancel; stale release; lost create reply; store errors returned without leaked leases |
+| `internal/lock/secret_test.go` | 5 | Grant, keep-alive and release by name with a 256-bit secret; empty, zero, one-bit-flipped, another lock's, guessed-lease-id, extended and oversized secrets all refused for release and keep-alive; the store holds only the SHA-256; 50 acquisitions give 50 different secrets; a lock key not written by this service is an error, not a holder |
 | `internal/memkv/memkv_test.go` | 6 | The backend contract; expiry exactly at the deadline; revision bumps; input limits; cancelled context and injected faults; 64 concurrent creates, one winner |
-| `internal/etcdkv/etcd_integration_test.go` | 3 | Against a real three-member etcd cluster: the contract, 6 clients over 3 members with 0 overlaps and increasing tokens, crash takeover. **CI only, not yet run** |
+| `internal/etcdkv/etcd_integration_test.go` | 4 | Against a real three-member etcd cluster: the contract, 6 clients over 3 members with 0 overlaps and increasing tokens, release and keep-alive refused without the owner secret, crash takeover. **CI only, not yet run** |
 
-Quality check against the 10 engineering rules, with the mutation table (15 of 15 hand mutants killed, 2 of them by tests added for survivors): [docs/quality/2026-11-01.md](docs/quality/2026-11-01.md).
+Quality check against the 10 engineering rules, with the mutation table (24 of 24 hand mutants killed: 2 by tests added for survivors, 9 written for the owner secret): [docs/quality/2026-11-01.md](docs/quality/2026-11-01.md).
 
-Headline results from the demo on this machine (in-process store, TTL 300 ms):
+Headline results from the demo on this machine (in-process store, TTL 300 ms, Go 1.26.11):
 
 | Result | Value |
 |---|---|
-| Contention | 200 acquisitions by 8 clients: 0 overlaps, tokens 2 to 400 strictly increasing, wait p99 75.8 ms |
+| Contention | 200 acquisitions by 8 clients: 0 overlaps, tokens 2 to 400 strictly increasing, wait p99 184.3 ms |
 | Renewal | Held for 5 TTLs with keep-alives; 50 attempts by another client, 0 succeeded |
-| Crash takeover | 304 ms after the holder stopped renewing (TTL 300 ms); token 404 to 406 |
+| Crash takeover | 301 ms after the holder stopped renewing (TTL 300 ms); token 404 to 406 |
 | Loss detection | Holder saw `ErrLost` 303 ms after renewals started failing (TTL 300 ms) |
 | Leases left | 0 |
-| govulncheck (Go 1.26.10) | One finding, GO-2026-6859 (net/http, fixed in Go 1.26.11), allowlisted by ID in `scripts/vulncheck.sh` until CI moves to 1.26.11; any other finding fails |
+| govulncheck (Go 1.26.11) | No vulnerabilities found; any finding fails `scripts/vulncheck.sh` |
 
 Not run locally: the race detector (needs cgo) and the real-etcd integration tests (no etcd cluster
 locally); both run in CI. CI has not run yet for this repository.
@@ -201,6 +212,7 @@ What this repo must show before it counts as done:
 - [ADR 0001: record architecture decisions](docs/adr/0001-record-architecture-decisions.md)
 - [ADR 0002: the fencing token is the create revision](docs/adr/0002-fencing-token-is-the-create-revision.md)
 - [ADR 0003: etcd JSON gateway with the standard library](docs/adr/0003-etcd-json-gateway-standard-library.md)
+- [ADR 0004: a random owner secret, not the lease id, proves who holds a lock](docs/adr/0004-owner-secret-not-lease-id.md)
 - [M1 results](docs/results/m1.md)
 - [Quality check](docs/quality/2026-11-01.md)
 
@@ -212,14 +224,17 @@ on the in-process store; real etcd runs only in CI.
 Known limitations in M1: a holder paused longer than its TTL can still write until storage checks
 tokens (M2); waiters poll with backoff, so there is no FIFO order; etcd counts TTLs in whole seconds
 and raises very short ones to its minimum; the in-process store is a single process and loses state
-on exit; the HTTP API has no authentication (it binds to 127.0.0.1 by default); the etcd client's
+on exit; the HTTP API has no caller authentication or TLS: any caller that can reach it can acquire a
+free lock, and the owner secret is a bearer credential that must not leak (the service binds to
+127.0.0.1 by default); the etcd client's
 JSON shapes are verified locally only against a fake gateway until the CI job runs.
 
 ## Security and contributing
 
 - Every GitHub Action is pinned to a commit SHA; the workflow runs read-only, without persisted credentials; the etcd release used in CI is checked against its SHA256SUMS.
 - Dependabot update pull requests are paused (`open-pull-requests-limit: 0`) so the repository keeps a single `main` branch; dependencies are updated by hand and checked by the CI audit.
-- Untrusted input is bounded and validated: lock names, owners, TTLs, lease ids, 4 KiB JSON bodies with no unknown fields, etcd endpoints and etcd answers (1 MiB limit); the server has read, write and idle timeouts.
+- Renew and release need the owner secret (256 random bits, stored as SHA-256, compared in constant time, never logged); a guessed or observed lease id gives no control over a lock.
+- Untrusted input is bounded and validated: lock names, owners, TTLs, secrets, 4 KiB JSON bodies with no unknown fields, etcd endpoints and etcd answers (1 MiB limit); the server has read, write and idle timeouts.
 - Report vulnerabilities privately: see [SECURITY.md](SECURITY.md). To contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License

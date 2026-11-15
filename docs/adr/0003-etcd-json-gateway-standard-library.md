@@ -20,8 +20,9 @@ the endpoints; 4xx answers are not retried. Keep-alive sends one message per cal
 ## Consequences
 
 - Nothing to vendor or update; govulncheck covers only the Go standard library. The flip side: a
-  standard-library advisory hits directly (GO-2026-6859 in net/http is reported with Go 1.26.10 and
-  allowed by ID in `scripts/vulncheck.sh` until CI moves to 1.26.11).
+  standard-library advisory hits directly, and the fix is a Go patch release. Example: GO-2026-6859
+  (net/http) was reported with Go 1.26.10 and allowed by ID until the move to Go 1.26.11 on
+  2026-11-15; since then govulncheck is clean and any finding fails.
 - One HTTP request per keep-alive instead of one long gRPC stream: more requests, simpler code. At a
   TTL of 10 s that is one request every 3.3 s per held lock.
 - The request and response shapes are written by hand. Locally they are tested against a fake

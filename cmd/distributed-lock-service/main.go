@@ -88,7 +88,11 @@ func serve(args []string, out io.Writer) error {
 		return err
 	}
 	log := slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{ReplaceAttr: utcTime}))
-	srv := &http.Server{Addr: *addr, Handler: api.New(b, log).Handler(), ReadHeaderTimeout: 5 * time.Second,
+	handler, err := api.New(b, log)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{Addr: *addr, Handler: handler.Handler(), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
